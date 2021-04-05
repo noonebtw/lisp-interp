@@ -3,6 +3,7 @@ use std::{
     fmt, io,
     ops::{Add, Sub},
     str::FromStr,
+    sync::Arc,
 };
 
 #[cfg(test)]
@@ -10,14 +11,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ast_builder() -> Result<(), LispError> {
-        let token_list = tokenize("(begin (defvar x 10) (+ x 5))")?;
+    fn test_nested_add() -> Result<(), LispError> {
+        let token_list = tokenize("(+ (+ 1 2) 3)")?;
+        let eval = LispExpression::build_from_tokens(&mut token_list.into_iter())?
+            .evaluate(&mut LispEnv::default())?;
 
-        println!("{:#?}", &token_list);
-
-        let ast = LispExpression::build_from_tokens(&mut token_list.into_iter())?;
-
-        println!("{:#?}", &ast);
+        println!("{:#?}", &eval);
 
         Ok(())
     }
@@ -37,23 +36,15 @@ mod tests {
             token_list
         );
 
-        println!("{:#?}", &token_list);
+        //println!("{:#?}", &token_list);
 
         let ast = LispExpression::build_from_tokens(&mut token_list.into_iter())?;
 
-        assert_eq!(
-            LispExpression {
-                atoms: vec![
-                    LispAtom::Identifier("+".to_string()),
-                    LispAtom::Literal(LispLiteral::Int(2)),
-                    LispAtom::Literal(LispLiteral::Int(2)),
-                ],
-                expressions: vec![],
-            },
-            ast
-        );
+        //println!("{:#?}", &ast);
 
-        println!("{:#?}", &ast);
+        let eval = ast.evaluate(&mut LispEnv::default())?;
+
+        println!("{:#?}", &eval);
 
         Ok(())
     }
@@ -66,6 +57,7 @@ pub enum LispError {
     UnexpectedToken(String),
     ExpectedToken(String),
     RuntimeError(String),
+    SymbolNotFound(String),
     IoError(io::Error),
 }
 
@@ -119,10 +111,32 @@ impl Add for LispLiteral {
                     self, rhs
                 ))),
             },
-            Self::String(ref i) => match rhs {
-                Self::String(ref k) => Ok(Self::String(format!("{}{}", i, k))),
+            _ => Err(LispError::RuntimeError(format!(
+                "Cannot add {:?} and {:?}",
+                self, rhs
+            ))),
+        }
+    }
+}
+
+impl<'a> Add for &'a LispLiteral {
+    type Output = Result<LispLiteral, LispError>;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        match self {
+            &LispLiteral::Int(i) => match rhs {
+                &LispLiteral::Int(k) => Ok(LispLiteral::Int(i + k)),
+                &LispLiteral::Float(k) => Ok(LispLiteral::Float(i as f32 + k)),
                 _ => Err(LispError::RuntimeError(format!(
-                    "Cannot add {:?} and {:?}: rhs is not String",
+                    "Cannot add {:?} and {:?}: rhs is not Int",
+                    self, rhs
+                ))),
+            },
+            &LispLiteral::Float(i) => match rhs {
+                &LispLiteral::Float(k) => Ok(LispLiteral::Float(i + k)),
+                &LispLiteral::Int(k) => Ok(LispLiteral::Float(i + k as f32)),
+                _ => Err(LispError::RuntimeError(format!(
+                    "Cannot add {:?} and {:?}: rhs is not Float",
                     self, rhs
                 ))),
             },
@@ -228,45 +242,65 @@ impl FromStr for LispLiteral {
     }
 }
 
-pub struct LispEnv<I>
-where
-    I: Iterator<Item = LispAtom>,
-{
-    procedures: HashMap<String, Box<dyn Fn(&mut Self, &mut I) -> Result<LispAtom, LispError>>>,
-    symbols: HashMap<String, LispLiteral>,
+pub struct LispEnv {
+    procedures: HashMap<
+        String,
+        Arc<dyn Fn(&mut Self, &mut LispExpression) -> Result<LispExpression, LispError>>,
+    >,
+    symbols: HashMap<String, LispExpression>,
 }
 
-impl<I> Default for LispEnv<I>
-where
-    I: Iterator<Item = LispAtom>,
-{
+impl Default for LispEnv {
     fn default() -> Self {
         let mut env = Self::new();
 
-        env.add_symbol("t", LispLiteral::Boolean(true));
-        env.add_symbol("nil", LispLiteral::Boolean(false));
+        env.add_symbol(
+            "t",
+            LispExpression::Atom(LispAtom::Literal(LispLiteral::Boolean(true))),
+        );
+        env.add_symbol(
+            "nil",
+            LispExpression::Atom(LispAtom::Literal(LispLiteral::Boolean(false))),
+        );
 
-        env.add_procedure("+", |_env, list| {
-            Ok(LispAtom::Literal(
-                list.map(|atom| match atom {
-                    LispAtom::Literal(lit) => Ok(lit),
-                    _ => Err(LispError::RuntimeError(
-                        "cannot add non literals".to_string(),
-                    )),
-                })
-                .reduce(|a, b| a? + b?)
-                .unwrap_or(Ok(LispLiteral::Int(0)))?,
-            ))
+        // this is probably horrible but why would anyone ever want to do anything in an interpreted language where you have to check literally everything to add 2 numbers
+        env.add_procedure("+", |_env, expr| match expr {
+            LispExpression::Atom(LispAtom::Literal(LispLiteral::Float(_))) => Ok(expr.to_owned()),
+            LispExpression::Atom(LispAtom::Literal(LispLiteral::Int(_))) => Ok(expr.to_owned()),
+            LispExpression::List(list) => {
+                if list.is_empty() {
+                    Ok(LispExpression::Atom(LispAtom::Literal(LispLiteral::Int(0))))
+                } else {
+                    Ok(LispExpression::Atom(LispAtom::Literal(
+                        list.iter()
+                            .map(|expr| match expr {
+                                LispExpression::Atom(LispAtom::Literal(lit)) => match lit {
+                                    LispLiteral::Float(_) => Ok(lit.to_owned()),
+                                    LispLiteral::Int(_) => Ok(lit.to_owned()),
+                                    _ => Err(LispError::RuntimeError(
+                                        "cant add expressions".to_string(),
+                                    )),
+                                },
+                                _ => {
+                                    Err(LispError::RuntimeError("cant add expressions".to_string()))
+                                }
+                            })
+                            .reduce(|a, b| (a? + b?))
+                            .unwrap_or(Ok(LispLiteral::Int(0)))?,
+                    )))
+                }
+            }
+            _ => Err(LispError::RuntimeError(format!(
+                "cannot add expression {:?}",
+                expr
+            ))),
         });
 
         env
     }
 }
 
-impl<I> LispEnv<I>
-where
-    I: Iterator<Item = LispAtom>,
-{
+impl LispEnv {
     fn new() -> Self {
         Self {
             procedures: HashMap::new(),
@@ -276,13 +310,18 @@ where
 
     fn add_procedure<F, S>(&mut self, symbol: S, proc: F)
     where
-        F: Fn(&mut Self, &mut I) -> Result<LispAtom, LispError> + 'static,
+        F: Fn(&mut Self, &mut LispExpression) -> Result<LispExpression, LispError> + 'static,
         S: ToString,
     {
-        self.procedures.insert(symbol.to_string(), Box::new(proc));
+        self.symbols.insert(
+            symbol.to_string(),
+            LispExpression::Atom(LispAtom::Identifier(symbol.to_string())),
+        );
+
+        self.procedures.insert(symbol.to_string(), Arc::new(proc));
     }
 
-    fn add_symbol<S>(&mut self, symbol: S, value: LispLiteral)
+    fn add_symbol<S>(&mut self, symbol: S, value: LispExpression)
     where
         S: ToString,
     {
@@ -292,36 +331,33 @@ where
 
 // I think this is equivalent to a Lisp AST node
 #[derive(Debug, PartialEq, Clone)]
-pub struct LispExpression {
-    atoms: Vec<LispAtom>,
-    expressions: Vec<LispExpression>,
+pub enum LispExpression {
+    Atom(LispAtom),
+    List(Vec<LispExpression>),
 }
 
 impl LispExpression {
     fn new() -> Self {
-        Self {
-            atoms: vec![],
-            expressions: vec![],
-        }
+        Self::List(vec![])
     }
 
     fn build_from_tokens_internal<I>(token_iter: &mut I) -> Result<Self, LispError>
     where
         I: Iterator<Item = LispToken>,
     {
-        let mut ast = Self::new();
+        let mut node = vec![];
 
         while let Some(tkn) = token_iter.next() {
             match tkn {
                 LispToken::ClosingParens => break,
-                LispToken::Atom(atom) => ast.atoms.push(atom),
-                LispToken::OpeningParens => ast
-                    .expressions
-                    .push(Self::build_from_tokens_internal(token_iter)?),
+                LispToken::Atom(atom) => node.push(Self::Atom(atom)),
+                LispToken::OpeningParens => {
+                    node.push(Self::build_from_tokens_internal(token_iter)?)
+                }
             }
         }
 
-        Ok(ast)
+        Ok(Self::List(node))
     }
 
     pub fn build_from_tokens<I>(token_iter: &mut I) -> Result<Self, LispError>
@@ -334,8 +370,109 @@ impl LispExpression {
         }
     }
 
+    fn evaluate_atom(&self, env: &mut LispEnv) -> Result<Self, LispError> {
+        assert!(std::matches!(self, Self::Atom { .. }));
+
+        match self {
+            Self::Atom(atom) => match atom {
+                LispAtom::Identifier(sym) => Ok(env
+                    .symbols
+                    .get(sym)
+                    .cloned()
+                    .ok_or(LispError::SymbolNotFound(sym.clone()))?),
+                LispAtom::Literal(lit) => Ok(LispExpression::Atom(LispAtom::Literal(lit.clone()))),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    fn evaluate_list(&self, env: &mut LispEnv) -> Result<Self, LispError> {
+        assert!(std::matches!(self, Self::List { .. }));
+
+        match self {
+            Self::List(list) => {
+                if list.is_empty() {
+                    Ok(Self::Atom(LispAtom::Literal(LispLiteral::Boolean(false))))
+                } else {
+                    if let Self::Atom(LispAtom::Identifier(identifer)) = &list[0] {
+                        if identifer == "if" && list.len() == 4 {
+                            let test = &list[1];
+                            let a = &list[2];
+                            let b = &list[3];
+
+                            if test.evaluate(env)?.is_true() {
+                                a.evaluate(env)
+                            } else {
+                                b.evaluate(env)
+                            }
+                        } else if identifer == "defvar" && list.len() == 3 {
+                            let (name, value) = (&list[1], &list[2]);
+
+                            let name = name.evaluate(env)?;
+                            let value = value.evaluate(env)?;
+
+                            match name {
+                                Self::Atom(LispAtom::Identifier(ref sym_name)) => {
+                                    env.add_symbol(sym_name, value);
+
+                                    Ok(name)
+                                }
+                                _ => Err(LispError::RuntimeError(
+                                    "variable name did not evaluate to string identifier"
+                                        .to_string(),
+                                )),
+                            }
+                        } else {
+                            // this is all the keywords im checking for so far, so this branch is exhausted
+                            Err(LispError::Exhausted)
+                        }
+                    } else {
+                        // i dont care about cases where the first expression is not an identifier currently
+                        Err(LispError::Exhausted)
+                    }
+                    .or_else(|_| {
+                        let proc = &list[0].evaluate(env)?;
+
+                        let args = list
+                            .iter()
+                            .skip(1)
+                            .map(|exp| exp.evaluate(env))
+                            .collect::<Result<Vec<_>, _>>()?;
+
+                        match proc {
+                            Self::Atom(LispAtom::Identifier(ref proc_name)) => {
+                                match env.procedures.get(proc_name).cloned() {
+                                    Some(proc) => proc(env, &mut Self::List(args)),
+                                    None => Err(LispError::RuntimeError(
+                                        "procedure name did not evaluate to a valid identifier"
+                                            .to_string(),
+                                    )),
+                                }
+                            }
+                            _ => Err(LispError::RuntimeError(
+                                "procedure name did not evaluate to string identifier".to_string(),
+                            )),
+                        }
+                    })
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn evaluate(&self, env: &mut LispEnv) -> Result<Self, LispError> {
+        match self {
+            Self::Atom(_) => self.evaluate_atom(env),
+            Self::List(_) => self.evaluate_list(env),
+        }
+    }
+
     pub fn is_nil(&self) -> bool {
-        self.atoms.is_empty() && self.expressions.is_empty()
+        match self {
+            Self::List(list) => list.is_empty(),
+            Self::Atom(LispAtom::Literal(LispLiteral::Boolean(b))) => b.clone(),
+            _ => false,
+        }
     }
 
     pub fn is_true(&self) -> bool {
